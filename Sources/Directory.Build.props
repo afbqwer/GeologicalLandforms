@@ -55,4 +55,9 @@
             Condition="Exists('%(EmitToDirectory.Identity)') AND Exists('$(TargetDir)$(TargetName).pdb')"
             Command="xcopy &quot;$(TargetDir)$(TargetName).pdb&quot; &quot;%(EmitToDirectory.Identity)&quot; /F /Y"/>
     </Target>
+
+    <Target Name="RegenerateLunarCheckFiles" AfterTargets="EmitToDirectory"
+            Condition="'$(MSBuildProjectName)' == 'GeologicalLandforms' Or '$(MSBuildProjectName)' == 'GeologicalLandformsMod'">
+        <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)regen-check-files.ps1&quot; -ModRoot &quot;$(MSBuildThisFileDirectory)..&quot;" />
+    </Target>
 </Project>
