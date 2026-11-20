@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using GeologicalLandforms.Defs;
@@ -117,8 +119,17 @@ public class WorldTileInfo : IWorldTileInfo
         // Prime the shared world component lookup so the worker threads only read it
         world.LandformData();
 
-        var threads = Math.Min(Environment.ProcessorCount, 16);
+        var threads = Math.Max(1, Math.Min(Environment.ProcessorCount, GetWarmCacheThreadLimit()));
         var chunk = (count + threads - 1) / threads;
+
+        // Keep the GC out of the fill: it is a closed block of work whose allocation is known from
+        // the previous run, so it can be pre-reserved. If the runtime cannot reserve the budget the
+        // region simply does not start and everything falls back to the normal behaviour.
+        var noGcBudgetMb = GetWarmCacheNoGcBudgetMb();
+        var noGcBudget = noGcBudgetMb << 20;
+        var noGcEntered = noGcBudget > 0 && TryStartNoGcRegion(noGcBudget);
+
+        PerfProbe.BeginFill(threads);
 
         Interlocked.Increment(ref _parallelFillDepth);
         try
@@ -128,19 +139,111 @@ public class WorldTileInfo : IWorldTileInfo
                 var from = worker * chunk;
                 var to = Math.Min(count, from + chunk);
 
+                PerfProbe.BeginWorker(worker);
                 for (var i = from; i < to; i++) Get(i);
+                PerfProbe.EndWorker(worker, to - from);
             });
         }
         finally
         {
             Interlocked.Decrement(ref _parallelFillDepth);
+            if (noGcEntered) EndNoGcRegion();
         }
+
+        PerfProbe.EndFill(count, threads, noGcEntered, noGcBudget);
+
 
         // If the cache was invalidated while filling, discard the result and try again next time
         if (_validCacheVersion == version)
         {
             _warmedCacheWorld = world;
             _warmedCacheVersion = version;
+        }
+    }
+
+    private static int _warmCacheThreadLimit;
+    private static long _warmCacheNoGcBudgetMb;
+    private static bool _warmCacheSettingsLoaded;
+
+    /// <summary>
+    /// Optional settings for the fill, read once from 'GeologicalLandforms-warmcache.txt' in the
+    /// RimWorld config folder. Accepted lines: a bare number or 'threads=N' (worker count), and
+    /// 'nogc=MB' (budget for the no-GC region; 0 disables it). Lets these be A/B tested without a
+    /// rebuild, since a full game restart is needed per measurement anyway.
+    /// </summary>
+    private static void LoadWarmCacheSettings()
+    {
+        if (_warmCacheSettingsLoaded) return;
+        _warmCacheSettingsLoaded = true;
+
+        _warmCacheThreadLimit = 16;
+        _warmCacheNoGcBudgetMb = 512;
+
+        try
+        {
+            var path = Path.Combine(GenFilePaths.ConfigFolderPath, "GeologicalLandforms-warmcache.txt");
+            if (!File.Exists(path)) return;
+
+            foreach (var rawLine in File.ReadAllLines(path))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal)) continue;
+
+                if (line.StartsWith("nogc", StringComparison.OrdinalIgnoreCase))
+                {
+                    var value = line.Contains('=') ? line.Substring(line.IndexOf('=') + 1).Trim() : "512";
+                    if (int.TryParse(value, out var mb) && mb >= 0) _warmCacheNoGcBudgetMb = mb;
+                }
+                else
+                {
+                    var value = line.StartsWith("threads", StringComparison.OrdinalIgnoreCase)
+                        ? line.Substring(line.IndexOf('=') + 1).Trim()
+                        : line;
+                    if (int.TryParse(value, out var workers) && workers > 0) _warmCacheThreadLimit = workers;
+                }
+            }
+        }
+        catch
+        {
+            // Diagnostics only: fall back to the defaults.
+        }
+    }
+
+    private static int GetWarmCacheThreadLimit()
+    {
+        LoadWarmCacheSettings();
+        return _warmCacheThreadLimit;
+    }
+
+    private static long GetWarmCacheNoGcBudgetMb()
+    {
+        LoadWarmCacheSettings();
+        return _warmCacheNoGcBudgetMb;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryStartNoGcRegion(long budgetBytes)
+    {
+        try
+        {
+            return GC.TryStartNoGCRegion(budgetBytes, disallowFullBlockingGC: true);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void EndNoGcRegion()
+    {
+        try
+        {
+            GC.EndNoGCRegion();
+        }
+        catch
+        {
+            // The region is aborted automatically when the budget is exceeded; nothing to undo.
         }
     }
 
@@ -179,14 +282,25 @@ public class WorldTileInfo : IWorldTileInfo
             if (canUseCache && allowFromCache)
             {
                 var match = cache[tileId];
-                if (match != null && match._cacheVersion == validVersion && match.World == world) return match;
+                if (match != null && match._cacheVersion == validVersion && match.World == world)
+                {
+                    PerfProbe.Count(ProbeCounter.CacheHits);
+                    return match;
+                }
             }
 
+            PerfProbe.Count(ProbeCounter.Tiles);
+            PerfProbe.BeginTile();
+
             var info = new WorldTileInfoPrimer(tileId, world.grid[tileId], world);
+            PerfProbe.MarkAlloc(ProbeBucket.Primer);
+
             var props = info.Biome.Properties();
+            PerfProbe.MarkAlloc(ProbeBucket.BiomeProps);
 
             var worldData = world.LandformData();
             var tileData = worldData != null && worldData.TryGet(tileId, out var found) ? found : null;
+            PerfProbe.MarkAlloc(ProbeBucket.LandformData);
 
             if (_tsc_waterTiles == null)
             {
@@ -201,19 +315,26 @@ public class WorldTileInfo : IWorldTileInfo
             }
 
             DetermineTopology(info, worldData, props);
+            PerfProbe.MarkAlloc(ProbeBucket.Topology);
 
             tileData?.ApplyTopology(info);
 
             DetermineLandforms(info, tileData, props);
+            PerfProbe.MarkAlloc(ProbeBucket.Landforms);
+
             DetermineBiomeVariants(info, tileData, props);
+            PerfProbe.MarkAlloc(ProbeBucket.Variants);
 
             GeologicalLandformsAPI.WorldTileInfoHook.Apply(world, info);
+            PerfProbe.MarkAlloc(ProbeBucket.Hook);
 
             if (canUseCache)
             {
                 info._cacheVersion = validVersion;
                 cache[tileId] = info;
             }
+
+            PerfProbe.EndTile();
 
             return info;
         }
@@ -292,7 +413,9 @@ public class WorldTileInfo : IWorldTileInfo
 
         var eligible = _tsc_eligible;
         var commonness = _tsc_commonness;
+        PerfProbe.Restart();
         var worldObject = info.WorldObject;
+        PerfProbe.MarkAlloc(ProbeBucket.LandformWorldObj);
 
         List<Landform> landforms = null;
 
@@ -335,6 +458,7 @@ public class WorldTileInfo : IWorldTileInfo
                 {
                     var landform = layerLandforms[landformIdx];
                     var value = landform.GetCommonnessForTile(info, worldObject);
+                    PerfProbe.Count(ProbeCounter.LandformEvals);
                     if (value > 0f && biomeProps.AllowsLandform(landform))
                     {
                         eligible.Add(landform);
@@ -375,10 +499,14 @@ public class WorldTileInfo : IWorldTileInfo
                     }
                 }
             }
+
+            PerfProbe.MarkAlloc(ProbeBucket.LandformLoop);
         }
 
         if (biomeProps.overrideLandforms != null)
         {
+            PerfProbe.Restart();
+
             var ids = _tsc_ids;
             ids.Clear();
 
@@ -392,14 +520,19 @@ public class WorldTileInfo : IWorldTileInfo
                 var landform = LandformManager.FindById(id);
                 if (landform != null) landforms.AddDistinct(landform);
             }
+
+            PerfProbe.MarkAlloc(ProbeBucket.LandformOverride);
         }
 
         if (landforms != null)
         {
+            PerfProbe.Restart();
             landforms.RemoveAll(lf => !GeologicalLandformsAPI.LandformEnabled.Apply(lf));
+            PerfProbe.MarkAlloc(ProbeBucket.LandformRemoveAll);
 
             // Iterate over a snapshot of the initial entries, as the loop may append to the list
             var initialCount = landforms.Count;
+            PerfProbe.Restart();
 
             for (var i = 0; i < initialCount; i++)
             {
@@ -412,7 +545,11 @@ public class WorldTileInfo : IWorldTileInfo
                 }
             }
 
+            PerfProbe.MarkAlloc(ProbeBucket.LandformApplyLayers);
+
+            PerfProbe.Restart();
             landforms.Sort((a, b) => a.Priority - b.Priority);
+            PerfProbe.MarkAlloc(ProbeBucket.LandformSort);
         }
 
         info.Landforms = landforms;
@@ -448,20 +585,30 @@ public class WorldTileInfo : IWorldTileInfo
         }
         else if (biomeProps.AllowBiomeTransitions)
         {
+            PerfProbe.Restart();
+
             foreach (var variant in DefDatabase<BiomeVariantDef>.AllDefsListForReading)
             {
                 var conditions = variant.worldTileConditions;
+                PerfProbe.Count(ProbeCounter.VariantEvals);
 
-                if (conditions == null || conditions.Get(ctxTile ??= new CtxTile(info)))
+                PerfProbe.Restart();
+                var passes = conditions == null || conditions.Get(ctxTile ??= new CtxTile(info));
+                PerfProbe.MarkVariantEval(variant.index);
+
+                if (passes)
                 {
                     variants ??= new(1);
                     variants.Add(variant);
                 }
             }
+
+            PerfProbe.MarkAlloc(ProbeBucket.VariantLoop);
         }
 
         if (biomeProps.overrideBiomeVariants != null)
         {
+            PerfProbe.Restart();
             var ids = _tsc_ids;
             ids.Clear();
 
@@ -475,9 +622,16 @@ public class WorldTileInfo : IWorldTileInfo
                 var variant = DefDatabase<BiomeVariantDef>.GetNamed(id, false);
                 if (variant != null) variants.AddDistinct(variant);
             }
+
+            PerfProbe.Mark(ProbeBucket.VariantOverride);
         }
 
-        variants?.RemoveAll(bv => !GeologicalLandformsAPI.BiomeVariantEnabled.Apply(bv));
+        if (variants != null)
+        {
+            PerfProbe.Restart();
+            variants.RemoveAll(bv => !GeologicalLandformsAPI.BiomeVariantEnabled.Apply(bv));
+            PerfProbe.Mark(ProbeBucket.VariantRemoveAll);
+        }
 
         info.BiomeVariants = variants;
     }
@@ -504,16 +658,20 @@ public class WorldTileInfo : IWorldTileInfo
     {
         if (biomeProps.isWaterCovered)
         {
+            PerfProbe.Restart();
             var coastType = WorldTileUtils.CoastTypeFromTile(info.Tile);
             info.Coast = new StructRot4<CoastType>(coastType);
             info.Topology = Topology.Ocean;
+            PerfProbe.Count(ProbeCounter.WaterTiles);
             return;
         }
 
         var grid = info.World.grid;
 
         int tileId = info.TileId;
+        PerfProbe.Restart();
         var tileCenter = grid.GetTileCenter(tileId);
+        PerfProbe.Mark(ProbeBucket.TileCenter);
 
         var nbData = grid.ExtNbValues();
         var nbOffsets = grid.ExtNbOffsets();
@@ -543,6 +701,8 @@ public class WorldTileInfo : IWorldTileInfo
 
         for (var nbIdx = nbOffset; nbIdx < nbBound; nbIdx++)
         {
+            PerfProbe.Restart();
+
             var idx = nbIdx - nbOffset;
             var nbId = (int) nbData[nbIdx];
             var nbTile = grid[nbId];
@@ -550,8 +710,11 @@ public class WorldTileInfo : IWorldTileInfo
             // warning: RotateCW and RotateCCW are not reliable and Rot6 indexes may be reversed
             // because tileIDToNeighbors order is cw for some tiles but ccw for others
             var rot6 = new Rot6(idx, grid.GetHeadingFromTo(tileCenter, grid.GetTileCenter(nbId)));
+            PerfProbe.MarkAlloc(ProbeBucket.NbCenter);
 
             var coastType = WorldTileUtils.CoastTypeFromTile(nbTile);
+            PerfProbe.MarkAlloc(ProbeBucket.NbCoast);
+
             if (coastType != CoastType.None)
             {
                 var rot4 = rot6.AsRot4();
@@ -561,7 +724,12 @@ public class WorldTileInfo : IWorldTileInfo
             }
             else
             {
-                if (BiomeTransition.IsTransition(tileId, nbId, info.Biome, nbTile.biome))
+                PerfProbe.Restart();
+
+                var isTransition = BiomeTransition.IsTransition(tileId, nbId, info.Biome, nbTile.biome);
+                PerfProbe.MarkAlloc(ProbeBucket.NbTransition);
+
+                if (isTransition)
                 {
                     borderingBiomes.Add(new BorderingBiome(nbTile.biome, rot6.Angle));
                 }
@@ -585,6 +753,8 @@ public class WorldTileInfo : IWorldTileInfo
             }
         }
 
+        PerfProbe.Count(ProbeCounter.Neighbors, nbBound - nbOffset);
+
         if (info.Tile.potentialRivers != null && info.Biome.allowRivers)
         {
             info.RiverType = info.Tile.potentialRivers.Count switch
@@ -600,9 +770,11 @@ public class WorldTileInfo : IWorldTileInfo
 
         if (borderingBiomes.Count > 0)
         {
+            PerfProbe.Restart();
             var bordering = new BorderingBiome[borderingBiomes.Count];
             borderingBiomes.CopyTo(bordering);
             info.BorderingBiomes = bordering;
+            PerfProbe.MarkAlloc(ProbeBucket.TopoBordering);
         }
         else
         {
@@ -621,7 +793,9 @@ public class WorldTileInfo : IWorldTileInfo
         {
             if (data?.GetCaveSystemDepthAt(tileId) > 0)
             {
+                PerfProbe.Restart();
                 DetermineCaveTopology(info);
+                PerfProbe.MarkAlloc(ProbeBucket.TopoHelpers);
                 return;
             }
 
@@ -634,7 +808,9 @@ public class WorldTileInfo : IWorldTileInfo
 
         if (waterTiles.Count > 0)
         {
+            PerfProbe.Restart();
             DetermineCoastTopology(info);
+            PerfProbe.MarkAlloc(ProbeBucket.TopoHelpers);
             return;
         }
 
@@ -646,7 +822,9 @@ public class WorldTileInfo : IWorldTileInfo
 
         if (cliffTiles.Count > 0)
         {
+            PerfProbe.Restart();
             DetermineCliffTopology(info);
+            PerfProbe.MarkAlloc(ProbeBucket.TopoHelpers);
             return;
         }
 
