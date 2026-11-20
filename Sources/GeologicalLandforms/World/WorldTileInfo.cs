@@ -98,6 +98,141 @@ public class WorldTileInfo : IWorldTileInfo
     private static int _warmedCacheVersion;
     private static int _parallelFillDepth;
 
+    // Tile centers are read once per tile and once per neighbor (about 3.7 times per tile), and
+    // PlanetLayer.GetTileCenter averages six vertices every call. One array of centers is cheaper
+    // than a million calls, and the values only change when the planet layer is regenerated.
+    private static Vector3[] _centerCache;
+    private static World _centerCacheWorld;
+    private static int _centerCacheVersion;
+
+    /// <summary>Builds the center cache for the current (world, cache version) pair.</summary>
+    private static void EnsureCenterCache(World world, int count, int threads)
+    {
+        var existing = _centerCache;
+        if (existing != null && _centerCacheWorld == world && _centerCacheVersion == _validCacheVersion
+            && existing.Length >= count)
+        {
+            return;
+        }
+
+        var centers = new Vector3[count];
+        var grid = world.grid;
+        var chunk = (count + threads - 1) / threads;
+
+        Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, worker =>
+        {
+            var from = worker * chunk;
+            var to = Math.Min(count, from + chunk);
+
+            for (var i = from; i < to; i++) centers[i] = grid.GetTileCenter(i);
+        });
+
+        _centerCache = centers;
+        _centerCacheWorld = world;
+        _centerCacheVersion = _validCacheVersion;
+    }
+
+    private static Vector3 CachedTileCenter(World world, int tileId)
+    {
+        var cache = _centerCache;
+        if (cache != null && _centerCacheVersion == _validCacheVersion
+            && ReferenceEquals(_centerCacheWorld, world) && (uint) tileId < (uint) cache.Length)
+        {
+            return cache[tileId];
+        }
+
+        return world.grid.GetTileCenter(tileId);
+    }
+
+    /// <summary>
+    /// Splits [0, count) into <paramref name="threads"/> contiguous ranges with roughly equal
+    /// numbers of land tiles. Land is what costs time; water short-circuits before topology and
+    /// landforms, so an equal tile split lets the lane with more land set the wall clock. Work is
+    /// counted per block, which keeps the partitioning itself a cheap pass over counters.
+    /// </summary>
+    private static int[] BuildLandBalancedBounds(World world, int count, int threads)
+    {
+        var bounds = new int[threads + 1];
+        bounds[threads] = count;
+
+        const int blockSize = 256;
+        var blocks = (count + blockSize - 1) / blockSize;
+
+        void SplitEvenly()
+        {
+            for (var i = 1; i < threads; i++) bounds[i] = (int) ((long) count * i / threads);
+        }
+
+        if (threads <= 1 || blocks < threads)
+        {
+            SplitEvenly();
+            return bounds;
+        }
+
+        var grid = world.grid;
+        var blockLand = new int[blocks];
+
+        Parallel.For(0, blocks, block =>
+        {
+            var from = block * blockSize;
+            var to = Math.Min(count, from + blockSize);
+            var land = 0;
+
+            for (var i = from; i < to; i++)
+            {
+                var biome = grid[i].biome;
+                if (biome != null && !biome.Properties().isWaterCovered) land++;
+            }
+
+            blockLand[block] = land;
+        });
+
+        var landTotal = 0;
+        for (var b = 0; b < blocks; b++) landTotal += blockLand[b];
+
+        if (landTotal == 0)
+        {
+            SplitEvenly();
+            return bounds;
+        }
+
+        var lane = 1;
+        var land = 0;
+
+        for (var b = 0; b < blocks && lane < threads; b++)
+        {
+            land += blockLand[b];
+            var blockEnd = Math.Min(count, (b + 1) * blockSize);
+
+            while (lane < threads && (long) land * threads >= (long) landTotal * lane
+                && blockEnd > bounds[lane - 1])
+            {
+                bounds[lane] = blockEnd;
+                lane++;
+            }
+        }
+
+        while (lane < threads) bounds[lane++] = count;
+        return bounds;
+    }
+
+    #if RW_1_6_OR_GREATER
+    /// <summary>
+    /// Same math as PlanetLayer.GetHeadingFromTo(Vector3, Vector3), except that the tangent basis
+    /// facing the north pole is passed in: it only depends on <paramref name="from"/>, so computing
+    /// it once per tile instead of once per neighbor removes five sixths of those calls.
+    /// </summary>
+    private static float HeadingFromTo(Vector3 from, Vector3 to, Vector3 forward, Vector3 right)
+    {
+        if (from == to) return 0f;
+
+        WorldRendererUtility.GetTangentialVectorFacing(from, to, out var forward2, out _);
+        var angle = Vector3.Angle(forward, forward2);
+        if (Vector3.Dot(forward2, right) < 0f) angle = 360f - angle;
+        return angle;
+    }
+    #endif
+
     /// <summary>
     /// Fills the tile info cache for the current world using all available cores. The cache is
     /// populated lazily by <see cref="Get(int,bool)"/> otherwise, which is the single largest
@@ -120,7 +255,6 @@ public class WorldTileInfo : IWorldTileInfo
         world.LandformData();
 
         var threads = Math.Max(1, Math.Min(Environment.ProcessorCount, GetWarmCacheThreadLimit()));
-        var chunk = (count + threads - 1) / threads;
 
         // Keep the GC out of the fill: it is a closed block of work whose allocation is known from
         // the previous run, so it can be pre-reserved. If the runtime cannot reserve the budget the
@@ -129,6 +263,13 @@ public class WorldTileInfo : IWorldTileInfo
         var noGcBudget = noGcBudgetMb << 20;
         var noGcEntered = noGcBudget > 0 && TryStartNoGcRegion(noGcBudget);
 
+        EnsureCenterCache(world, count, threads);
+
+        // Water tiles short-circuit before topology and landforms, so an equal tile split makes the
+        // lane that happens to contain more land the slowest one and sets the wall clock. Split on
+        // land count instead, at block granularity so the partitioning itself stays cheap.
+        var bounds = BuildLandBalancedBounds(world, count, threads);
+
         PerfProbe.BeginFill(threads);
 
         Interlocked.Increment(ref _parallelFillDepth);
@@ -136,8 +277,8 @@ public class WorldTileInfo : IWorldTileInfo
         {
             Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, worker =>
             {
-                var from = worker * chunk;
-                var to = Math.Min(count, from + chunk);
+                var from = bounds[worker];
+                var to = bounds[worker + 1];
 
                 PerfProbe.BeginWorker(worker);
                 for (var i = from; i < to; i++) Get(i);
@@ -670,7 +811,12 @@ public class WorldTileInfo : IWorldTileInfo
 
         int tileId = info.TileId;
         PerfProbe.Restart();
-        var tileCenter = grid.GetTileCenter(tileId);
+        var tileCenter = CachedTileCenter(info.World, tileId);
+
+        #if RW_1_6_OR_GREATER
+        WorldRendererUtility.GetTangentialVectorFacing(tileCenter, grid.NorthPolePos, out var headingForward, out var headingRight);
+        #endif
+
         PerfProbe.Mark(ProbeBucket.TileCenter);
 
         var nbData = grid.ExtNbValues();
@@ -707,9 +853,17 @@ public class WorldTileInfo : IWorldTileInfo
             var nbId = (int) nbData[nbIdx];
             var nbTile = grid[nbId];
 
+            var nbCenter = CachedTileCenter(info.World, nbId);
+
             // warning: RotateCW and RotateCCW are not reliable and Rot6 indexes may be reversed
             // because tileIDToNeighbors order is cw for some tiles but ccw for others
-            var rot6 = new Rot6(idx, grid.GetHeadingFromTo(tileCenter, grid.GetTileCenter(nbId)));
+            #if RW_1_6_OR_GREATER
+            var heading = HeadingFromTo(tileCenter, nbCenter, headingForward, headingRight);
+            #else
+            var heading = grid.GetHeadingFromTo(tileCenter, nbCenter);
+            #endif
+
+            var rot6 = new Rot6(idx, heading);
             PerfProbe.MarkAlloc(ProbeBucket.NbCenter);
 
             var coastType = WorldTileUtils.CoastTypeFromTile(nbTile);
