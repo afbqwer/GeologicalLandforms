@@ -177,9 +177,26 @@ if (tileData == null && biomeProps.overrideLandforms == null
 
 1. `LunarFramework/Sources/Directory.Build.props` 的 `RimWorldPath=..\..\..\..` 是按"LunarFramework 是独立 mod 目录"计算的；它现在嵌在 GL 目录里，需要用参数覆盖：
    `dotnet build LunarFramework\Sources\LunarFramework\LunarFramework.csproj -c Release -p:RimWorldPath="<RimWorld 根目录>"`
-2. 其后置的 `RegenerateLunarCheckFiles` 目标同样路径错误；构建后手动执行 `Sources/regen-check-files.ps1 -ModRoot <mod 根>` 重算 `.lfc`（`MD5(dll) XOR MD5(About/Version.txt)`），否则 LunarLoader 会认为组件校验失败。
-3. 产物 `LunarFramework.dll`（1.2.2）与 `.lfc` 已更新到 `1.7/Lunar/Components/`；**1.6 未重编**。
+2. 其后置的 `RegenerateLunarCheckFiles` 目标同样路径错误；构建后手动执行 `Sources/regen-check-files.ps1 -ModRoot <mod 根>` 重算 `.lfc`（`MD5(dll) XOR MD5(About/Version.txt)`）。即便忘记重算也不会再阻止加载：见下面的"校验降级"。
+3. 产物 `LunarFramework.dll`（1.2.2）与 `.lfc` 已更新到 `1.7/Lunar/Components/`；`LunarLoader.dll`（1.2.2）更新到 `1.7/Assemblies/`；**1.6 未重编**。
 4. `LunarFramework/` 在父仓库中是一个未跟踪的嵌套 git 检出（不在 `.gitmodules` 里），这些改动需要在该目录内单独提交，不会随 GL 的提交带走。
+
+### ⑥ 校验降级为 advisory（已实现）
+
+`.lfc` 校验原本是硬性门槛：任意一份 `LunarFramework.dll`、`HarmonyLib.dll`、mod 的 `Manifest.xml` 或 Lunar 组件 DLL 的哈希不匹配（或 `.lfc` 缺失），对应的加载就会被拒绝；框架层面的校验失败还会导致**所有** Lunar mod 一起不加载。对本地重编和第三方副本来说这个风险不可控。
+
+改动（`LunarLoader.dll` + `LunarFramework.dll`）：
+
+| 位置 | 原行为 | 现行为 |
+|---|---|---|
+| `LunarLoader.VerifyFile`（原 `CheckFile`） | 哈希不符 / `.lfc` 缺失 → 返回 false | 只记 `Log.Warning`，继续加载 |
+| `LunarLoader` 框架/Harmony 分支 | 额外检查 `.lfc` 是否存在，缺失即报错退出 | 去掉存在性门槛，统一走 `VerifyFile` |
+| `Entrypoint.PrepareMod`（`Manifest.xml`） | `.lfc` 缺失或哈希不符 → 该 mod 的组件不加载 | 记 Warning 后继续 |
+| `Entrypoint` 组件校验 | 同上（逐组件） | 同上 |
+
+实际文件不存在（DLL 缺失、版本信息无效、Manifest 解析失败）仍然是硬错误——降级的只是完整性/哈希校验，避免"文件被本地重编过"这类正常情况把框架拖垮。
+
+**这一条属于 fork 的本地策略，不建议提给上游**：上游保留严格校验是合理的；只是分叉版需要容忍自己重编的组件。
 
 ## 6. 其它优化项（已解决 / 待验证）
 
