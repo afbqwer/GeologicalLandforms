@@ -128,18 +128,86 @@ public static class ExtensionUtils
     #if RW_1_6_OR_GREATER
 
     public static SurfaceTile.RiverLink LargestRiverLink(this SurfaceTile tile)
-        => tile.Rivers?.OrderByDescending(r => r.river.WidthOnWorld()).FirstOrDefault() ?? default;
+    {
+        var links = tile.Rivers;
+        if (links == null) return default;
+
+        var best = default(SurfaceTile.RiverLink);
+        var bestWidth = -1f;
+
+        foreach (var link in links)
+        {
+            var width = link.river.WidthOnWorld();
+            if (width <= bestWidth) continue;
+
+            best = link;
+            bestWidth = width;
+        }
+
+        return best;
+    }
 
     public static SurfaceTile.RoadLink LargestRoadLink(this SurfaceTile tile)
-        => tile.Roads?.OrderByDescending(r => r.road.WidthOnWorld()).FirstOrDefault() ?? default;
+    {
+        var links = tile.Roads;
+        if (links == null) return default;
+
+        var best = default(SurfaceTile.RoadLink);
+        var bestWidth = -1f;
+
+        foreach (var link in links)
+        {
+            var width = link.road.WidthOnWorld();
+            if (width <= bestWidth) continue;
+
+            best = link;
+            bestWidth = width;
+        }
+
+        return best;
+    }
 
     #else
 
     public static Tile.RiverLink LargestRiverLink(this Tile tile)
-        => tile.Rivers?.OrderByDescending(r => r.river.WidthOnWorld()).FirstOrDefault() ?? default;
+    {
+        var links = tile.Rivers;
+        if (links == null) return default;
+
+        var best = default(Tile.RiverLink);
+        var bestWidth = -1f;
+
+        foreach (var link in links)
+        {
+            var width = link.river.WidthOnWorld();
+            if (width <= bestWidth) continue;
+
+            best = link;
+            bestWidth = width;
+        }
+
+        return best;
+    }
 
     public static Tile.RoadLink LargestRoadLink(this Tile tile)
-        => tile.Roads?.OrderByDescending(r => r.road.WidthOnWorld()).FirstOrDefault() ?? default;
+    {
+        var links = tile.Roads;
+        if (links == null) return default;
+
+        var best = default(Tile.RoadLink);
+        var bestWidth = -1f;
+
+        foreach (var link in links)
+        {
+            var width = link.road.WidthOnWorld();
+            if (width <= bestWidth) continue;
+
+            best = link;
+            bestWidth = width;
+        }
+
+        return best;
+    }
 
     #endif
 

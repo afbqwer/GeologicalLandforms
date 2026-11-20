@@ -280,6 +280,16 @@ public class WorldTileInfo : IWorldTileInfo
 
     private static void DetermineLandforms(WorldTileInfo info, TileData tileData, BiomeProperties biomeProps)
     {
+        // Biomes like ocean or lake disallow every landform, so the whole layer loop below can
+        // only ever produce an empty result for them. Skip it, including the world object lookup.
+        if (tileData == null && biomeProps.overrideLandforms == null
+            && !biomeProps.AllowLandforms && !biomeProps.AllowBiomeTransitions
+            && biomeProps.allowedLandforms == null)
+        {
+            info.Landforms = null;
+            return;
+        }
+
         var eligible = _tsc_eligible;
         var commonness = _tsc_commonness;
         var worldObject = info.WorldObject;
@@ -337,7 +347,11 @@ public class WorldTileInfo : IWorldTileInfo
                 else
                 {
                     var seed = info.StableSeed(layer.SelectionSeed);
-                    var rand = RandAsync.Range(0f, Math.Max(1f, commonness.Sum()), seed);
+
+                    var totalCommonness = 0f;
+                    for (var i = 0; i < commonness.Count; i++) totalCommonness += commonness[i];
+
+                    var rand = RandAsync.Range(0f, Math.Max(1f, totalCommonness), seed);
 
                     for (var i = 0; i < eligible.Count; i++)
                     {
@@ -375,10 +389,18 @@ public class WorldTileInfo : IWorldTileInfo
         {
             landforms.RemoveAll(lf => !GeologicalLandformsAPI.LandformEnabled.Apply(lf));
 
-            foreach (var nodeApplyLayer in landforms.SelectMany(lf => lf.ApplyLayers).ToList())
+            // Iterate over a snapshot of the initial entries, as the loop may append to the list
+            var initialCount = landforms.Count;
+
+            for (var i = 0; i < initialCount; i++)
             {
-                var landform = LandformManager.FindById(nodeApplyLayer.LayerId);
-                if (landform != null) landforms.AddDistinct(landform);
+                var applyLayers = landforms[i].ApplyLayers;
+
+                for (var j = 0; j < applyLayers.Count; j++)
+                {
+                    var landform = LandformManager.FindById(applyLayers[j].LayerId);
+                    if (landform != null) landforms.AddDistinct(landform);
+                }
             }
 
             landforms.Sort((a, b) => a.Priority - b.Priority);

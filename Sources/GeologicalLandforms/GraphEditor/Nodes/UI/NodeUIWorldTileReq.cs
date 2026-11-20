@@ -289,9 +289,20 @@ public class NodeUIWorldTileReq : NodeUIBase
 
         public float GetScore(NodeUIWorldTileReq node, IWorldTileInfo tile, bool lenient)
         {
-            var entry = node.AllowedBiomes.FirstOrDefault(e => e.BiomeDef == tile.Biome.defName);
-            if (entry.BiomeDef != null) return entry.Commonness;
-            return node.AllowedBiomes.FirstOrDefault(e => e.BiomeDef == null).Commonness;
+            var allowedBiomes = node.AllowedBiomes;
+            var biomeDefName = tile.Biome.defName;
+
+            for (var i = 0; i < allowedBiomes.Count; i++)
+            {
+                if (allowedBiomes[i].BiomeDef == biomeDefName) return allowedBiomes[i].Commonness;
+            }
+
+            for (var i = 0; i < allowedBiomes.Count; i++)
+            {
+                if (allowedBiomes[i].BiomeDef == null) return allowedBiomes[i].Commonness;
+            }
+
+            return 0f;
         }
 
         public void EditorGUI(NodeUIWorldTileReq node, LayoutRect layout)
