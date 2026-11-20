@@ -44,6 +44,8 @@ public class WorldLayer_Landforms : WorldLayer
         var stopwatch = new Stopwatch();
         stopwatch.Start();
 
+        WorldTileInfo.WarmCache();
+
         for (int tileIdx = 0; tileIdx < tilesCount; ++tileIdx)
         {
             try

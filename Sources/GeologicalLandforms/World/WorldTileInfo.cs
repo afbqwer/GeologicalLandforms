@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using GeologicalLandforms.Defs;
 using GeologicalLandforms.GraphEditor;
 using HarmonyLib;
@@ -91,6 +92,58 @@ public class WorldTileInfo : IWorldTileInfo
     private static WorldTileInfoPrimer[] _cache;
     private static int _validCacheVersion = 1;
 
+    private static World _warmedCacheWorld;
+    private static int _warmedCacheVersion;
+    private static int _parallelFillDepth;
+
+    /// <summary>
+    /// Fills the tile info cache for the current world using all available cores. The cache is
+    /// populated lazily by <see cref="Get(int,bool)"/> otherwise, which is the single largest
+    /// cost when opening the world map after loading a save. Safe to call repeatedly; only
+    /// does work once per (world, cache version) pair.
+    /// </summary>
+    internal static void WarmCache()
+    {
+        var cache = _cache;
+        var world = Find.World;
+        if (cache == null || world?.grid == null) return;
+
+        var count = Math.Min(cache.Length, world.grid.TilesCount);
+        if (count <= 0) return;
+
+        var version = _validCacheVersion;
+        if (_warmedCacheWorld == world && _warmedCacheVersion == version) return;
+
+        // Prime the shared world component lookup so the worker threads only read it
+        world.LandformData();
+
+        var threads = Math.Min(Environment.ProcessorCount, 16);
+        var chunk = (count + threads - 1) / threads;
+
+        Interlocked.Increment(ref _parallelFillDepth);
+        try
+        {
+            Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, worker =>
+            {
+                var from = worker * chunk;
+                var to = Math.Min(count, from + chunk);
+
+                for (var i = from; i < to; i++) Get(i);
+            });
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _parallelFillDepth);
+        }
+
+        // If the cache was invalidated while filling, discard the result and try again next time
+        if (_validCacheVersion == version)
+        {
+            _warmedCacheWorld = world;
+            _warmedCacheVersion = version;
+        }
+    }
+
     public static IWorldTileInfo Get(Map map, bool allowFromCache = true)
     {
         #if RW_1_5_OR_GREATER
@@ -167,7 +220,9 @@ public class WorldTileInfo : IWorldTileInfo
         catch (ThreadAbortException) { throw; }
         catch (Exception e)
         {
-            InvalidateCache();
+            // While filling the cache in parallel, invalidating it here would discard the entries
+            // that the other threads already computed, so only the failing tile falls back.
+            if (Volatile.Read(ref _parallelFillDepth) == 0) InvalidateCache();
             GeologicalLandformsAPI.Logger.Error($"Failed to get info for world tile {tileId}", e);
 
             #if RW_1_6_OR_GREATER
