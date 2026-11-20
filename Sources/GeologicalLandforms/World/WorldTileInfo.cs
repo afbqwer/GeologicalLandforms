@@ -318,13 +318,22 @@ public class WorldTileInfo : IWorldTileInfo
         }
         else
         {
-            foreach (var layer in LandformManager.LandformLayers)
+            // Indexed loops: foreach over IReadOnlyList<T> allocates an enumerator per call,
+            // and this runs for every land tile.
+            var layers = LandformManager.LandformLayers;
+
+            for (var layerIdx = 0; layerIdx < layers.Count; layerIdx++)
             {
+                var layer = layers[layerIdx];
+
                 eligible.Clear();
                 commonness.Clear();
 
-                foreach (var landform in layer.Landforms)
+                var layerLandforms = layer.Landforms;
+
+                for (var landformIdx = 0; landformIdx < layerLandforms.Count; landformIdx++)
                 {
+                    var landform = layerLandforms[landformIdx];
                     var value = landform.GetCommonnessForTile(info, worldObject);
                     if (value > 0f && biomeProps.AllowsLandform(landform))
                     {
@@ -413,7 +422,9 @@ public class WorldTileInfo : IWorldTileInfo
     {
         List<BiomeVariantDef> variants = null;
 
-        var ctxTile = new CtxTile(info);
+        // CtxTile is a struct, so passing it as ICtxTile boxes it. Box at most once per tile
+        // instead of once per variant evaluated below, which is the hot part of this method.
+        ICtxTile ctxTile = null;
 
         if (tileData != null)
         {
@@ -439,7 +450,9 @@ public class WorldTileInfo : IWorldTileInfo
         {
             foreach (var variant in DefDatabase<BiomeVariantDef>.AllDefsListForReading)
             {
-                if (variant.worldTileConditions?.Get(ctxTile) ?? true)
+                var conditions = variant.worldTileConditions;
+
+                if (conditions == null || conditions.Get(ctxTile ??= new CtxTile(info)))
                 {
                     variants ??= new(1);
                     variants.Add(variant);
@@ -457,7 +470,7 @@ public class WorldTileInfo : IWorldTileInfo
             variants ??= new(3);
             variants.Clear();
 
-            foreach (var id in biomeProps.overrideBiomeVariants.Get(ctxTile, ids))
+            foreach (var id in biomeProps.overrideBiomeVariants.Get(ctxTile ??= new CtxTile(info), ids))
             {
                 var variant = DefDatabase<BiomeVariantDef>.GetNamed(id, false);
                 if (variant != null) variants.AddDistinct(variant);
@@ -483,6 +496,9 @@ public class WorldTileInfo : IWorldTileInfo
 
     [ThreadStatic]
     private static List<Rot6> _tsc_caveSystemTiles;
+
+    [ThreadStatic]
+    private static List<BorderingBiome> _tsc_borderingBiomes;
 
     private static void DetermineTopology(WorldTileInfo info, LandformData data, BiomeProperties biomeProps)
     {
@@ -517,7 +533,10 @@ public class WorldTileInfo : IWorldTileInfo
         nonCliffTiles.Clear();
         caveSystemTiles.Clear();
 
-        List<BorderingBiome> borderingBiomes = null;
+        List<BorderingBiome> borderingBiomes = _tsc_borderingBiomes;
+        if (borderingBiomes == null) _tsc_borderingBiomes = borderingBiomes = new(2);
+        borderingBiomes.Clear();
+
         var coast = new StructRot4<CoastType>();
 
         var nbRiverCount = 0;
@@ -544,7 +563,6 @@ public class WorldTileInfo : IWorldTileInfo
             {
                 if (BiomeTransition.IsTransition(tileId, nbId, info.Biome, nbTile.biome))
                 {
-                    borderingBiomes ??= new List<BorderingBiome>(2);
                     borderingBiomes.Add(new BorderingBiome(nbTile.biome, rot6.Angle));
                 }
 
@@ -580,7 +598,17 @@ public class WorldTileInfo : IWorldTileInfo
             };
         }
 
-        info.BorderingBiomes = borderingBiomes?.ToArray();
+        if (borderingBiomes.Count > 0)
+        {
+            var bordering = new BorderingBiome[borderingBiomes.Count];
+            borderingBiomes.CopyTo(bordering);
+            info.BorderingBiomes = bordering;
+        }
+        else
+        {
+            info.BorderingBiomes = null;
+        }
+
         info.Coast = coast;
 
         if (nbBound - nbOffset != 6)

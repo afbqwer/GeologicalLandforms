@@ -71,10 +71,13 @@ public class WorldLayer_Landforms : WorldLayer
                     }
                 }
 
-                if (anyGraphicInBiomeVariants && tile.HasBiomeVariants())
+                var biomeVariants = tile.BiomeVariants;
+
+                if (anyGraphicInBiomeVariants && biomeVariants is { Count: > 0 })
                 {
-                    foreach (var biomeVariant in tile.BiomeVariants)
+                    for (var variantIdx = 0; variantIdx < biomeVariants.Count; variantIdx++)
                     {
+                        var biomeVariant = biomeVariants[variantIdx];
                         var material = biomeVariant.DrawMaterial;
                         if (material != null)
                         {
@@ -96,10 +99,13 @@ public class WorldLayer_Landforms : WorldLayer
                     }
                 }
 
-                if (anyGraphicInLandforms && !anyVariantGraphic && tile.HasLandforms())
+                var landforms = tile.Landforms;
+
+                if (anyGraphicInLandforms && !anyVariantGraphic && landforms is { Count: > 0 })
                 {
-                    foreach (var landform in tile.Landforms)
+                    for (var landformIdx = 0; landformIdx < landforms.Count; landformIdx++)
                     {
+                        var landform = landforms[landformIdx];
                         var atlas = landform.WorldTileGraphic?.Atlas;
                         if (atlas != null)
                         {
