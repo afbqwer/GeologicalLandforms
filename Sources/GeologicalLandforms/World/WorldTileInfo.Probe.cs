@@ -117,7 +117,7 @@ internal static class PerfProbe
         _on = true;
 
         _workerStartTicks = Stopwatch.GetTimestamp();
-        _workerAllocStart = GC.GetAllocatedBytesForCurrentThread();
+        _workerAllocStart = ReadAllocatedBytes();
         Restart();
     }
 
@@ -126,7 +126,7 @@ internal static class PerfProbe
     {
         var now = Stopwatch.GetTimestamp();
         _workerWall[worker] = (now - _workerStartTicks) * 1000.0 / Stopwatch.Frequency;
-        _workerAlloc[worker] = GC.GetAllocatedBytesForCurrentThread() - _workerAllocStart;
+        _workerAlloc[worker] = ReadAllocatedBytes() - _workerAllocStart;
         _workerTiles[worker] = tiles;
         _workerThreadIds[worker] = Thread.CurrentThread.ManagedThreadId;
         _workerTicks[worker] = _ticks;
@@ -166,7 +166,7 @@ internal static class PerfProbe
     {
         if (!_on) return;
         _segTicks = Stopwatch.GetTimestamp();
-        _segAlloc = GC.GetAllocatedBytesForCurrentThread();
+        _segAlloc = ReadAllocatedBytes();
     }
 
     [Conditional(Symbol)]
@@ -183,7 +183,7 @@ internal static class PerfProbe
     {
         if (!_on) return;
         var now = Stopwatch.GetTimestamp();
-        var alloc = GC.GetAllocatedBytesForCurrentThread();
+        var alloc = ReadAllocatedBytes();
         _ticks[(int) bucket] += now - _segTicks;
         _allocs[(int) bucket] += alloc - _segAlloc;
         _segTicks = now;
@@ -195,7 +195,7 @@ internal static class PerfProbe
     internal static void MarkVariantEval(int variantIndex)
     {
         if (!_on) return;
-        var alloc = GC.GetAllocatedBytesForCurrentThread();
+        var alloc = ReadAllocatedBytes();
         var delta = alloc - _segAlloc;
         _segAlloc = alloc;
 
@@ -428,6 +428,17 @@ internal static class PerfProbe
         GeologicalLandformsAPI.Logger.Log("  workers: " + workerReport);
     }
 
+    /// <summary>Per-thread allocation counter. Not available on net472 (the 1.6 target), where it reports 0.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long ReadAllocatedBytes()
+    {
+        #if NET5_0_OR_GREATER
+        return GC.GetAllocatedBytesForCurrentThread();
+        #else
+        return 0;
+        #endif
+    }
+
     private static long ReadProcessCpuTicks()
     {
         try
@@ -445,7 +456,11 @@ internal static class PerfProbe
     {
         try
         {
+            #if NET5_0_OR_GREATER
             return GC.GetTotalPauseDuration().TotalMilliseconds;
+            #else
+            return -1;
+            #endif
         }
         catch
         {

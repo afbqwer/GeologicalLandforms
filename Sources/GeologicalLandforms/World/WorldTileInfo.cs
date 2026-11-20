@@ -263,18 +263,18 @@ public class WorldTileInfo : IWorldTileInfo
         var noGcBudget = noGcBudgetMb << 20;
         var noGcEntered = noGcBudget > 0 && TryStartNoGcRegion(noGcBudget);
 
-        EnsureCenterCache(world, count, threads);
-
-        // Water tiles short-circuit before topology and landforms, so an equal tile split makes the
-        // lane that happens to contain more land the slowest one and sets the wall clock. Split on
-        // land count instead, at block granularity so the partitioning itself stays cheap.
-        var bounds = BuildLandBalancedBounds(world, count, threads);
-
-        PerfProbe.BeginFill(threads);
-
         Interlocked.Increment(ref _parallelFillDepth);
         try
         {
+            EnsureCenterCache(world, count, threads);
+
+            // Water tiles short-circuit before topology and landforms, so an equal tile split makes
+            // the lane that happens to contain more land the slowest one and sets the wall clock.
+            // Split on land count instead, at block granularity so the partitioning stays cheap.
+            var bounds = BuildLandBalancedBounds(world, count, threads);
+
+            PerfProbe.BeginFill(threads);
+
             Parallel.For(0, threads, new ParallelOptions { MaxDegreeOfParallelism = threads }, worker =>
             {
                 var from = bounds[worker];
@@ -287,12 +287,12 @@ public class WorldTileInfo : IWorldTileInfo
         }
         finally
         {
+            // Also reached when the setup above throws, so the no-GC region cannot be left open.
             Interlocked.Decrement(ref _parallelFillDepth);
             if (noGcEntered) EndNoGcRegion();
         }
 
         PerfProbe.EndFill(count, threads, noGcEntered, noGcBudget);
-
 
         // If the cache was invalidated while filling, discard the result and try again next time
         if (_validCacheVersion == version)

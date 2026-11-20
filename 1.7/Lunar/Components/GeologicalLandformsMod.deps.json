@@ -8,14 +8,14 @@
     ".NETCoreApp,Version=v10.0": {
       "GeologicalLandformsMod/1.8.1": {
         "dependencies": {
-          "GeologicalLandforms": "1.8.0",
+          "GeologicalLandforms": "1.8.1",
           "TerrainGraph": "1.2.4"
         },
         "runtime": {
           "GeologicalLandformsMod.dll": {}
         }
       },
-      "GeologicalLandforms/1.8.0": {
+      "GeologicalLandforms/1.8.1": {
         "dependencies": {
           "TerrainGraph": "1.2.4"
         },
@@ -42,7 +42,7 @@
       "serviceable": false,
       "sha512": ""
     },
-    "GeologicalLandforms/1.8.0": {
+    "GeologicalLandforms/1.8.1": {
       "type": "project",
       "serviceable": false,
       "sha512": ""
